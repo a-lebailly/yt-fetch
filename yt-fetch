@@ -1,0 +1,293 @@
+#!/bin/bash
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/lib"
+[[ -d "$LIB_DIR" ]] || LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/lib/yt-fetch"
+[[ -d "$LIB_DIR" ]] || LIB_DIR="/usr/local/lib/yt-fetch"
+
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/deps.sh"
+source "$LIB_DIR/ui.sh"
+source "$LIB_DIR/notify.sh"
+source "$LIB_DIR/history.sh"
+source "$LIB_DIR/url.sh"
+source "$LIB_DIR/playlist.sh"
+source "$LIB_DIR/quality.sh"
+source "$LIB_DIR/download.sh"
+source "$LIB_DIR/settings.sh"
+
+usage() {
+    cat <<EOF
+Usage:
+  yt-fetch [options] <url>
+
+Options:
+  -u, --url <url>                 Video or playlist URL
+  -m, --mode <mp4|mp3|both>       Download mode (default: mp4)
+  -q, --quality <max|safe|light>  Quality preset (default: safe)
+      --playlist                  Download the full playlist
+      --single                    Download only the selected video (default)
+      --playlist-name <name>      Output folder name for playlist downloads
+  -y, --overwrite                 Replace existing files without prompting
+  -h, --help                      Show this help
+
+Examples:
+  yt-fetch -m mp3 -q safe "https://youtu.be/..."
+  yt-fetch --url "https://youtu.be/..." --mode mp4
+  yt-fetch --mode both --quality max --overwrite "https://youtu.be/..."
+  yt-fetch --playlist --playlist-name my_mix -m mp4 -q light "https://youtube.com/playlist?list=..."
+EOF
+}
+
+die() {
+    echo "[!] $*" >&2
+    exit 1
+}
+
+parse_cli_args() {
+    NON_INTERACTIVE=0
+    CLI_OVERWRITE=0
+    CLI_MODE="MP4 (Video)"
+    CLI_PRESET="SAFE"
+    CLI_PLAYLIST_MODE="single"
+    CLI_PLAYLIST_NAME=""
+    CLI_URL=""
+
+    [[ "$#" -eq 0 ]] && return 0
+    NON_INTERACTIVE=1
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -u|--url)
+                [[ $# -ge 2 ]] || die "Missing value for $1"
+                [[ -z "$CLI_URL" ]] || die "Only one URL can be provided"
+                CLI_URL="$2"
+                shift 2
+                ;;
+            -m|--mode)
+                [[ $# -ge 2 ]] || die "Missing value for $1"
+                case "${2,,}" in
+                    mp4|video) CLI_MODE="MP4 (Video)" ;;
+                    mp3|audio) CLI_MODE="MP3 (Audio)" ;;
+                    both|all|mp4+mp3) CLI_MODE="MP4 + MP3" ;;
+                    *) die "Invalid mode: $2" ;;
+                esac
+                shift 2
+                ;;
+            -q|--quality)
+                [[ $# -ge 2 ]] || die "Missing value for $1"
+                case "${2^^}" in
+                    MAX|SAFE|LIGHT) CLI_PRESET="${2^^}" ;;
+                    CUSTOM) die "CUSTOM requires the TUI" ;;
+                    *) die "Invalid quality: $2" ;;
+                esac
+                shift 2
+                ;;
+            --playlist)
+                CLI_PLAYLIST_MODE="playlist"
+                shift
+                ;;
+            --single)
+                CLI_PLAYLIST_MODE="single"
+                shift
+                ;;
+            --playlist-name)
+                [[ $# -ge 2 ]] || die "Missing value for $1"
+                CLI_PLAYLIST_NAME=$(sanitize_playlist_name "$2")
+                [[ -n "$CLI_PLAYLIST_NAME" ]] || die "Playlist name cannot be empty"
+                CLI_PLAYLIST_MODE="playlist"
+                shift 2
+                ;;
+            -y|--overwrite)
+                CLI_OVERWRITE=1
+                shift
+                ;;
+            --)
+                shift
+                [[ $# -le 1 ]] || die "Only one URL can be provided"
+                CLI_URL="${1:-}"
+                shift "$#"
+                ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
+            *)
+                [[ -z "$CLI_URL" ]] || die "Only one URL can be provided"
+                CLI_URL="$1"
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$CLI_URL" ]] || die "Missing URL"
+    if [[ "$CLI_PLAYLIST_MODE" == "playlist" && -z "$CLI_PLAYLIST_NAME" ]]; then
+        die "--playlist requires --playlist-name"
+    fi
+}
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+parse_cli_args "$@"
+ensure_runtime_dirs
+
+[[ "$NON_INTERACTIVE" == "0" ]] && show_banner
+check_deps
+build_ytdlp_cmd
+
+while true; do
+    # ── URL ──────────────────────────────────────────────────────────────────
+    if [[ "$NON_INTERACTIVE" == "1" ]]; then
+        URL="$CLI_URL"
+    else
+        URL=$(get_url)
+    fi
+    if [[ "$URL" == "__MANAGE_HISTORY__" ]]; then
+        manage_history
+        show_banner
+        continue
+    fi
+    if [[ "$URL" == "__SETTINGS__" ]]; then
+        show_settings
+        show_banner
+        continue
+    fi
+    [[ "$URL" == "__LOOP__" ]] && { show_banner; continue; }
+    [[ -z "$URL" ]] && { echo "No URL provided."; exit 1; }
+
+    # ── Playlist ─────────────────────────────────────────────────────────────
+    PLAYLIST_MODE="single"
+    PLAYLIST_NAME=""
+    if [[ "$NON_INTERACTIVE" == "1" ]]; then
+        PLAYLIST_MODE="$CLI_PLAYLIST_MODE"
+        PLAYLIST_NAME="$CLI_PLAYLIST_NAME"
+    else
+        handle_playlist
+    fi
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    echo "[+] Fetching metadata..."
+    TITLE=$("${YTDLP[@]}" --no-playlist --print title "$URL" 2>/dev/null \
+        | head -1 || echo "Unknown")
+    echo "    $TITLE"
+    echo
+
+    # ── Mode ─────────────────────────────────────────────────────────────────
+    if [[ "$NON_INTERACTIVE" == "1" ]]; then
+        MODE="$CLI_MODE"
+    else
+        MODE=$(printf 'MP4 (Video)\nMP3 (Audio)\nMP4 + MP3\n' \
+            | fzf --prompt="Mode > " --height=6) || { show_banner; continue; }
+    fi
+
+    # ── File existence check ──────────────────────────────────────────────────
+    DOWNLOAD_MP4=0
+    DOWNLOAD_MP3=0
+    FORCE_OVERWRITE_MP4=0
+    FORCE_OVERWRITE_MP3=0
+
+    [[ "$MODE" != "MP3 (Audio)" ]] && DOWNLOAD_MP4=1
+    [[ "$MODE" != "MP4 (Video)" ]] && DOWNLOAD_MP3=1
+
+    if [[ "$DOWNLOAD_MP3" == "1" ]]; then
+        EXISTING_MP3=$(check_existing_file MP3)
+        if [[ -n "$EXISTING_MP3" ]]; then
+            if [[ "$NON_INTERACTIVE" == "1" && "$CLI_OVERWRITE" == "1" ]]; then
+                FORCE_OVERWRITE_MP3=1
+            elif [[ "$NON_INTERACTIVE" == "1" ]]; then
+                echo "[!] MP3 already exists, skipping: $EXISTING_MP3"
+                DOWNLOAD_MP3=0
+            elif confirm_overwrite MP3 "$EXISTING_MP3"; then
+                FORCE_OVERWRITE_MP3=1
+            else
+                DOWNLOAD_MP3=0
+            fi
+        fi
+    fi
+
+    if [[ "$DOWNLOAD_MP4" == "1" ]]; then
+        EXISTING_MP4=$(check_existing_file MP4)
+        if [[ -n "$EXISTING_MP4" ]]; then
+            if [[ "$NON_INTERACTIVE" == "1" && "$CLI_OVERWRITE" == "1" ]]; then
+                FORCE_OVERWRITE_MP4=1
+            elif [[ "$NON_INTERACTIVE" == "1" ]]; then
+                echo "[!] MP4 already exists, skipping: $EXISTING_MP4"
+                DOWNLOAD_MP4=0
+            elif confirm_overwrite MP4 "$EXISTING_MP4"; then
+                FORCE_OVERWRITE_MP4=1
+            else
+                DOWNLOAD_MP4=0
+            fi
+        fi
+    fi
+
+    if [[ "$DOWNLOAD_MP4" == "0" && "$DOWNLOAD_MP3" == "0" ]]; then
+        [[ "$NON_INTERACTIVE" == "1" ]] && exit 0
+        show_banner
+        continue
+    fi
+
+    # ── Quality ──────────────────────────────────────────────────────────────
+    if [[ "$NON_INTERACTIVE" == "1" ]]; then
+        PRESET="$CLI_PRESET"
+    else
+        PRESET=$(pick_preset) || { show_banner; continue; }
+    fi
+
+    # ── Download ─────────────────────────────────────────────────────────────
+    case "$MODE" in
+        "MP4 (Video)")
+            FORMAT=$(resolve_video_format "$URL" "$PRESET")
+            notify "yt-fetch" "Downloading MP4: $TITLE"
+            echo "[+] Downloading MP4 [$PRESET]..."
+            [[ "$DOWNLOAD_MP4" == "1" ]] && download_mp4 "$URL" "$FORMAT"
+            log_history "MP4" "$TITLE" "$URL"
+            notify "yt-fetch" "Done: $TITLE"
+            ;;
+        "MP3 (Audio)")
+            FORMAT=$(resolve_audio_format "$URL" "$PRESET")
+            notify "yt-fetch" "Downloading MP3: $TITLE"
+            echo "[+] Downloading MP3 [$PRESET]..."
+            [[ "$DOWNLOAD_MP3" == "1" ]] && download_mp3 "$URL" "$FORMAT"
+            log_history "MP3" "$TITLE" "$URL"
+            notify "yt-fetch" "Done: $TITLE"
+            ;;
+        "MP4 + MP3")
+            HISTORY_MODE=""
+            notify "yt-fetch" "Downloading: $TITLE"
+            if [[ "$DOWNLOAD_MP4" == "1" ]]; then
+                FMT_V=$(resolve_video_format "$URL" "$PRESET")
+                echo "[+] Downloading MP4 [$PRESET]..."
+                download_mp4 "$URL" "$FMT_V"
+                HISTORY_MODE="MP4"
+            fi
+            if [[ "$DOWNLOAD_MP3" == "1" ]]; then
+                FMT_A=$(resolve_audio_format "$URL" "$PRESET")
+                echo "[+] Downloading MP3 [$PRESET]..."
+                download_mp3 "$URL" "$FMT_A"
+                [[ -n "$HISTORY_MODE" ]] && HISTORY_MODE+="+"
+                HISTORY_MODE+="MP3"
+            fi
+            log_history "$HISTORY_MODE" "$TITLE" "$URL"
+            notify "yt-fetch" "Done: $TITLE"
+            ;;
+        *)
+            show_banner
+            continue
+            ;;
+    esac
+
+    echo
+    echo "================================"
+    echo " Done!"
+    [[ "$DOWNLOAD_MP4" == "1" ]] && echo " MP4 -> $MP4_DIR"
+    [[ "$DOWNLOAD_MP3" == "1" ]] && echo " MP3 -> $MP3_DIR"
+    echo "================================"
+    [[ "$NON_INTERACTIVE" == "1" ]] && break
+    sleep 2
+    show_banner
+done
